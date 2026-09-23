@@ -29,6 +29,11 @@
     "weight_decay": 2e-4,
     "print_forget":true,
     "free": 9,
+    "dynamic_k": true,
+    "k_min": 5,
+    "k_max": 11,
+    "warmup_epochs": 3,
+    "gradient_threshold": 1.5,
     "alpha": 0.9,
     "m": 0.4
 

@@ -374,6 +374,57 @@ class VisionTransformer(nn.Module):
         for block in self.blocks:
             block.copy_lora_weights(loraidA,loraidB,A_loras,B_loras)
 
+    def compute_gradient_variance(self) -> list:
+        """Tính gradient variance cho LoRA params ở mỗi block.
+        Dùng để chẩn đoán mức độ domain shift tại từng tầng.
+        Trả về list[float] có length = depth (12 cho ViT-B/16)."""
+        gv_per_block = []
+        for block in self.blocks:
+            grads = []
+            for name, param in block.attn.named_parameters():
+                if ('lora_A' in name or 'lora_B' in name) and 'ema' not in name:
+                    if param.grad is not None:
+                        grads.append(param.grad.detach().flatten())
+            if grads:
+                all_grads = torch.cat(grads)
+                gv_per_block.append(all_grads.var().item())
+            else:
+                gv_per_block.append(0.0)
+        return gv_per_block
+
+    def determine_dynamic_k(self, k_min=5, k_max=11, threshold=1.5) -> int:
+        """Dựa trên gradient variance, xác định ngưỡng k tối ưu.
+        
+        Logic: Quét từ tầng sâu nhất (k_max-1) ngược về tầng nông (k_min).
+        Nếu gradient variance ở tầng nông cao hơn ngưỡng trung bình,
+        đó là dấu hiệu dữ liệu lạ → hạ k để giải phóng thêm tầng
+        cho Task-specific LoRA.
+        
+        Args:
+            k_min: Giới hạn dưới cho k (ít nhất k_min tầng Shared)
+            k_max: Giới hạn trên cho k (nhiều nhất k_max tầng Shared)
+            threshold: Ngưỡng tỷ lệ GV so với trung bình
+            
+        Returns:
+            int: Giá trị k mới (split point)
+        """
+        gv = self.compute_gradient_variance()
+        if not gv or all(v == 0 for v in gv):
+            return self.select  # Giữ nguyên k mặc định nếu không có gradient
+
+        mean_gv = sum(gv) / len(gv)
+        if mean_gv == 0:
+            return self.select
+
+        # Tìm tầng nông nhất mà GV vẫn cao (cần task-specific adaptation)
+        # Quét từ k_max-1 ngược về k_min
+        new_k = k_max
+        for i in range(k_max - 1, k_min - 1, -1):
+            if gv[i] > threshold * mean_gv:
+                new_k = i  # Hạ k xuống tầng này
+        
+        return max(k_min, min(k_max, new_k))
+
     @torch.jit.ignore
     def no_weight_decay(self):
         return {'pos_embed', 'cls_token', 'dist_token'}

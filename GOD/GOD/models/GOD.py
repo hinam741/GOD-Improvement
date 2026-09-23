@@ -87,13 +87,34 @@ class Learner(BaseLearner):
             self.lora_ids.append(self._cur_task)
             for param in self._network.parameters():
                 param.requires_grad = False
-            self._network.backbone.unfreeze_lora([self._cur_task], self.args["free"])
-            self._network.update_simplefc(self._total_classes)
-            for param in self._network.simple_fc.parameters():
-                param.requires_grad = True
-            self._network.to(self._device)
-            self._network.fc.add_task_layer()
-            self._network.to(self._device)
+
+            # === DYNAMIC LAYER SPLITTING ===
+            if self.args.get("dynamic_k", False):
+                # Phase 1: Warm-up để đo gradient variance và quyết định k
+                self._network.update_simplefc(self._total_classes)
+                for param in self._network.simple_fc.parameters():
+                    param.requires_grad = True
+                self._network.to(self._device)
+                self._network.fc.add_task_layer()
+                self._network.to(self._device)
+                effective_k = self._warmup_and_determine_k(train_loader)
+                logging.info("Dynamic k: {} -> {} for task {}".format(
+                    self.args["free"], effective_k, self._cur_task))
+                # Phase 2: Re-configure với k mới
+                for param in self._network.parameters():
+                    param.requires_grad = False
+                self._network.backbone.unfreeze_lora([self._cur_task], effective_k)
+                for param in self._network.simple_fc.parameters():
+                    param.requires_grad = True
+            else:
+                # Giữ nguyên hành vi gốc: k cố định
+                self._network.backbone.unfreeze_lora([self._cur_task], self.args["free"])
+                self._network.update_simplefc(self._total_classes)
+                for param in self._network.simple_fc.parameters():
+                    param.requires_grad = True
+                self._network.to(self._device)
+                self._network.fc.add_task_layer()
+                self._network.to(self._device)
 
             optimizer = optim.SGD(
                 self._network.parameters(),
@@ -181,6 +202,80 @@ class Learner(BaseLearner):
             )
             prog_bar.set_description(info)
             logging.info(info)
+
+    def _warmup_and_determine_k(self, train_loader):
+        """Chạy warm-up epochs với k_min, đo gradient variance, quyết định k tối ưu.
+        
+        Logic:
+        1. Tạm unfreeze LoRA từ k_min (nhiều tầng nhất) để gradient chảy qua tất cả
+        2. Chạy vài epoch warm-up với learning rate thấp
+        3. Sau warm-up, đo gradient variance mỗi tầng
+        4. Nếu tầng nông có GV cao → dữ liệu lạ → giữ k thấp
+        5. Nếu tầng nông có GV thấp → dữ liệu quen → giữ k cao (tiết kiệm params)
+        
+        Returns:
+            int: Giá trị k tối ưu cho task hiện tại
+        """
+        warmup_epochs = self.args.get("warmup_epochs", 3)
+        k_min = self.args.get("k_min", 5)
+        k_max = self.args.get("k_max", 11)
+        threshold = self.args.get("gradient_threshold", 1.5)
+
+        # Tạm unfreeze từ k_min để gradient chảy qua nhiều tầng nhất
+        self._network.backbone.unfreeze_lora([self._cur_task], k_min)
+        for param in self._network.simple_fc.parameters():
+            param.requires_grad = True
+
+        optimizer_warmup = optim.SGD(
+            filter(lambda p: p.requires_grad, self._network.parameters()),
+            lr=self.args["lrate"] * 0.1,  # LR thấp hơn cho warm-up
+            momentum=0.9,
+            weight_decay=self.args["weight_decay"],
+        )
+
+        logging.info("[Dynamic k] Starting warm-up: {} epochs with k_min={}".format(
+            warmup_epochs, k_min))
+
+        for epoch in range(warmup_epochs):
+            self._network.train()
+            for i, (_, inputs, targets) in enumerate(train_loader):
+                inputs, targets = inputs.to(self._device), targets.to(self._device)
+                outputs = self._network(inputs, self._cur_task, Train=True)
+                logits = outputs["logits"]
+                fake_targets = targets - self._known_classes
+                classlogits = self._network.simple_fc(outputs["feature"], fake_targets)["logits"]
+                loss_etf = F.cross_entropy(logits, fake_targets)
+                loss_ac = F.cross_entropy(classlogits, fake_targets)
+                loss = loss_etf + loss_ac
+                optimizer_warmup.zero_grad()
+                loss.backward()
+                optimizer_warmup.step()
+
+        # Sau warm-up: chạy thêm 1 forward+backward để có gradient mới nhất
+        self._network.train()
+        for i, (_, inputs, targets) in enumerate(train_loader):
+            inputs, targets = inputs.to(self._device), targets.to(self._device)
+            outputs = self._network(inputs, self._cur_task, Train=True)
+            logits = outputs["logits"]
+            fake_targets = targets - self._known_classes
+            classlogits = self._network.simple_fc(outputs["feature"], fake_targets)["logits"]
+            loss = F.cross_entropy(logits, fake_targets) + F.cross_entropy(classlogits, fake_targets)
+            optimizer_warmup.zero_grad()
+            loss.backward()
+            break  # Chỉ cần 1 batch để lấy gradient
+
+        # Tính gradient variance và quyết định k
+        gv = self._network.backbone.compute_gradient_variance()
+        new_k = self._network.backbone.determine_dynamic_k(
+            k_min=k_min, k_max=k_max, threshold=threshold
+        )
+
+        logging.info("[Dynamic k] Gradient variance per block: {}".format(
+            ["{:.6f}".format(v) for v in gv]))
+        logging.info("[Dynamic k] Determined k={} (range [{}, {}], threshold={})".format(
+            new_k, k_min, k_max, threshold))
+
+        return new_k
 
     def _eval_cnn(self, loader):
         self._network.eval()
