@@ -118,11 +118,36 @@ class LinearList(nn.Linear, LoRALayer):
         def T(w):
             return w.transpose(0, 1) if self.fan_in_fan_out else w  
         nn.Linear.train(self, mode)
+
+    def reset_to_shared(self, lora_id: int):
+        """Ghi đè LoRA của task `lora_id` bằng Shared LoRA (LoRA của task 0).
+        Dùng cho các tầng nông (l < k_t) để đảm bảo task t thực sự dùng chung SL,
+        kể cả khi warm-up / task trước (với k nhỏ hơn) đã cập nhật các tầng này."""
+        if lora_id <= 0 or lora_id >= len(self.lora_As):
+            return
+        with torch.no_grad():
+            self.lora_As[lora_id].data.copy_(self.lora_As[0].data)
+            self.lora_Bs[lora_id].data.copy_(self.lora_Bs[0].data)
+
+    def _gated_forward(self, x, result, lora_ids, ifEMA, gate_alpha):
+        """Micro gating: Output = α·SL(x) + (1-α)·TL(x), với α + β = 1.
+        SL = LoRA của task 0 (Shared, đã đóng băng); TL = LoRA của task hiện tại (hoặc TL_ema)."""
+        xd = self.lora_dropout(x)
+        sl = (xd @ self.lora_As[0].transpose(0, 1) @ self.lora_Bs[0].transpose(0, 1)) * self.task_scalings[0]
+        if ifEMA:
+            tl = (xd @ self.lora_emaA.transpose(0, 1) @ self.lora_emaB.transpose(0, 1)) * self.task_scaling_EMA
+        else:
+            t = lora_ids[0]
+            tl = (xd @ self.lora_As[t].transpose(0, 1) @ self.lora_Bs[t].transpose(0, 1)) * self.task_scalings[t]
+        lora_output = gate_alpha * sl + (1.0 - gate_alpha) * tl
+        return {'result': result + lora_output, 'loraValue': lora_output}
     
-    def forward(self, x: torch.Tensor, lora_ids: list = [0],ifEMA= False):
+    def forward(self, x: torch.Tensor, lora_ids: list = [0],ifEMA= False, gate_alpha=None):
         def T(w):
             return w.transpose(0, 1) if self.fan_in_fan_out else w
         result = F.linear(x, T(self.weight), bias=self.bias)
+        if gate_alpha is not None and len(self.lora_As) > 0:
+            return self._gated_forward(x, result, lora_ids, ifEMA, gate_alpha)
         lora_output = torch.zeros_like(result)
         if(ifEMA):
             lora_A = self.lora_emaA
@@ -174,6 +199,46 @@ class LinearList(nn.Linear, LoRALayer):
             raise ValueError(f"Invalid lora_id. loraidA should be between 0 and {len(self.lora_As)-1}, "
                             f"and loraidB should be between 0 and {len(self.lora_As)-1}.")
 
+
+class LayerGate(nn.Module):
+    """Mô-đun Gating (Điều phối Micro) cho một tầng Transformer và một task.
+
+        Output_l = α_l · SL_l(x) + β_l · TL_{l,t}(x),   β_l = 1 - α_l
+
+    - 'scalar': α_l là một tham số học được cho mỗi cặp (tầng, task).
+    - 'router': α_l(x) = σ(w · mean_tokens(h) + b) phụ thuộc vào đầu vào.
+      w khởi tạo bằng 0 nên lúc đầu router tương đương bản 'scalar'.
+    α khởi tạo nhỏ (mặc định 0.1) để hành vi ban đầu gần với GOD gốc (thuần TL).
+    """
+    def __init__(self, dim, gate_type='scalar', init_alpha=0.1):
+        super().__init__()
+        if gate_type not in ('scalar', 'router'):
+            raise ValueError("gating_type must be 'scalar' or 'router', got {}".format(gate_type))
+        self.gate_type = gate_type
+        init_alpha = min(max(float(init_alpha), 1e-4), 1.0 - 1e-4)
+        init_logit = math.log(init_alpha / (1.0 - init_alpha))
+        if gate_type == 'scalar':
+            self.logit = nn.Parameter(torch.tensor(init_logit))
+        else:
+            self.router = nn.Linear(dim, 1)
+            nn.init.zeros_(self.router.weight)
+            nn.init.constant_(self.router.bias, init_logit)
+        # Giá trị α trung bình của lần forward gần nhất (chỉ để logging/phân tích)
+        self.register_buffer('last_alpha', torch.tensor(init_alpha), persistent=False)
+
+    def forward(self, h):
+        if self.gate_type == 'scalar':
+            alpha = torch.sigmoid(self.logit)
+        else:
+            alpha = torch.sigmoid(self.router(h.mean(dim=1))).view(-1, 1, 1)  # [B,1,1]
+        self.last_alpha = alpha.detach().mean()
+        return alpha
+
+    def mean_alpha(self) -> float:
+        if self.gate_type == 'scalar':
+            return torch.sigmoid(self.logit.detach()).item()
+        return float(self.last_alpha)
+
     
 class Attention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., config=None):
@@ -204,6 +269,11 @@ class Attention(nn.Module):
         self.cur_loraid = self.q_proj.add_task()
         self.k_proj.add_task()
         self.v_proj.add_task()
+        return self.cur_loraid
+    def reset_to_shared(self, lora_id: int):
+        self.q_proj.reset_to_shared(lora_id)
+        self.k_proj.reset_to_shared(lora_id)
+        self.v_proj.reset_to_shared(lora_id)
     def startEMA(self):
         # 深拷贝数据（独立内存）
         self.q_proj.startEMA()
@@ -228,12 +298,12 @@ class Attention(nn.Module):
         self.k_proj.copy_lora_weights(loraidA,loraidB,A_loras,B_loras)
         self.v_proj.copy_lora_weights(loraidA,loraidB,A_loras,B_loras)   
 
-    def forward(self, x,lora_ids=[0],ifEMA=False):
+    def forward(self, x,lora_ids=[0],ifEMA=False,gate_alpha=None):
         B, N, C = x.shape
 
-        q = self.q_proj(x,lora_ids,ifEMA)['result']
-        k = self._shape(self.k_proj(x,lora_ids,ifEMA)['result'], -1, B).view(B * self.num_heads, -1, self.head_dim)
-        v = self._shape(self.v_proj(x,lora_ids,ifEMA)['result'], -1, B).view(B * self.num_heads, -1, self.head_dim)
+        q = self.q_proj(x,lora_ids,ifEMA,gate_alpha)['result']
+        k = self._shape(self.k_proj(x,lora_ids,ifEMA,gate_alpha)['result'], -1, B).view(B * self.num_heads, -1, self.head_dim)
+        v = self._shape(self.v_proj(x,lora_ids,ifEMA,gate_alpha)['result'], -1, B).view(B * self.num_heads, -1, self.head_dim)
         q = self._shape(q, N, B).view(B * self.num_heads, -1, self.head_dim)
 
         # attn = (q @ k.transpose(-2, -1)) * self.scale
@@ -268,23 +338,58 @@ class Block(nn.Module):
         self.fc2 = nn.Linear(mlp_hidden_dim, dim)
         self.act = act_layer()
         self.mlp_drop = nn.Dropout(drop)
+
+        # === MICRO GATING: mỗi task có 1 gate riêng tại tầng này (index trùng lora_id) ===
+        self.use_gating = bool(getattr(config, 'gating', False)) if config is not None else False
+        self.gate_type = getattr(config, 'gating_type', 'scalar') if config is not None else 'scalar'
+        self.gate_init_alpha = float(getattr(config, 'gate_init_alpha', 0.1)) if config is not None else 0.1
+        self.gates = nn.ModuleList()
+        if self.use_gating:
+            # Gate EMA dùng cho Coarse inference (đi kèm TL_ema)
+            self.gate_ema = LayerGate(dim, self.gate_type, self.gate_init_alpha)
+            self.gate_ema.requires_grad_(False)
+            self.register_buffer('gate_ema_ready', torch.tensor(False))
     def unfreeze_lora(self,lora_ids):
         self.attn.unfreeze_lora(lora_ids)
+        if self.use_gating:
+            for lora_id in lora_ids:
+                if 0 < lora_id < len(self.gates):  # task 0 không có gating
+                    self.gates[lora_id].requires_grad_(True)
     def add_task(self):
         self.cur_loraid = self.attn.add_task()
+        if self.use_gating:
+            gate = LayerGate(self.norm1.normalized_shape[0], self.gate_type, self.gate_init_alpha)
+            gate.requires_grad_(False)  # chỉ mở khi unfreeze_lora cho task hiện tại
+            self.gates.append(gate.to(self.norm1.weight.device))
+        return self.cur_loraid
+    def reset_to_shared(self, lora_id: int):
+        self.attn.reset_to_shared(lora_id)
     def freeze_lora(self,lora_ids: list, A_loras: bool,B_loras:bool):
         self.attn.freeze_lora(lora_ids,A_loras,B_loras)
     def startEMA(self):
         # 深拷贝数据（独立内存）
         self.attn.startEMA()
-    def EMA(self,alpha):
+    def EMA(self,alpha,gate_id=None):
         # 深拷贝数据（独立内存）
         self.attn.EMA(alpha)
+        # EMA cho gate: chỉ cập nhật khi task hiện tại thực sự dùng gating ở tầng này
+        if self.use_gating and gate_id is not None and 0 < gate_id < len(self.gates):
+            src = self.gates[gate_id]
+            with torch.no_grad():
+                if not bool(self.gate_ema_ready):
+                    for p_ema, p_src in zip(self.gate_ema.parameters(), src.parameters()):
+                        p_ema.data.copy_(p_src.data)
+                    self.gate_ema_ready.fill_(True)
+                else:
+                    for p_ema, p_src in zip(self.gate_ema.parameters(), src.parameters()):
+                        p_ema.data.mul_(alpha).add_(p_src.data, alpha=1.0 - alpha)
     def copy_lora_weights(self, loraidA: int, loraidB: int,A_loras: bool,B_loras:bool):
         self.attn.copy_lora_weights(loraidA,loraidB,A_loras,B_loras)
 
-    def forward(self, x,lora_ids=[0],ifEMA=False):
-        x = x + self.drop_path(self.attn(self.norm1(x),lora_ids,ifEMA))
+    def forward(self, x,lora_ids=[0],ifEMA=False,gate=None):
+        h = self.norm1(x)
+        gate_alpha = gate(h) if gate is not None else None
+        x = x + self.drop_path(self.attn(h,lora_ids,ifEMA,gate_alpha))
         residual = x
         x = self.mlp_drop(self.act(self.fc1(self.norm2(x))))
         x = self.drop_path(self.mlp_drop(self.fc2(x)))
@@ -309,7 +414,13 @@ class VisionTransformer(nn.Module):
         self.cur_loraid = 0
         norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
         act_layer = act_layer or nn.GELU
+        # self.select: điểm tách SL/TL dùng cho Refined inference (= min k_t trên các task)
         self.select=9
+        # k riêng cho từng task (Dynamic Layer Splitting): {task_id: k_t}
+        self.task_k = {}
+        # Micro gating
+        self.use_gating = bool(getattr(tuning_config, 'gating', False)) if tuning_config is not None else False
+        self.gating_active = True  # tắt tạm thời trong warm-up đo gradient variance
         self.patch_embed = embed_layer(
             img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
         num_patches = self.patch_embed.num_patches
@@ -360,16 +471,50 @@ class VisionTransformer(nn.Module):
 
     def unfreeze_lora(self,lora_ids,select=9):
         lengh1 = select
-        self.select = lengh1
+        # Ghi nhận k riêng cho từng task; điểm tách chung cho Refined = min k_t
+        for lora_id in lora_ids:
+            self.task_k[lora_id] = lengh1
+        self.select = min(self.task_k.values()) if self.task_k else lengh1
         for block in self.blocks[lengh1:]:
             block.unfreeze_lora(lora_ids)
         print(lengh1)
+    def sync_shared_lora(self, lora_id: int, k: int):
+        """Các tầng l < k của task `lora_id` phải dùng đúng Shared LoRA (task 0)."""
+        for block in self.blocks[:k]:
+            block.reset_to_shared(lora_id)
+    def _resolve_gate(self, idx, lora_ids, ifEMA):
+        """Trả về LayerGate cần dùng tại block `idx`, hoặc None nếu không gating.
+        Gating chỉ áp dụng ở vùng TL của task (l >= k_t) và với task t > 0."""
+        if not (self.use_gating and self.gating_active):
+            return None
+        blk = self.blocks[idx]
+        if ifEMA:
+            if idx >= self.select and bool(blk.gate_ema_ready):
+                return blk.gate_ema
+            return None
+        if len(lora_ids) != 1:
+            return None
+        t = lora_ids[0]
+        if t <= 0 or t >= len(blk.gates) or idx < self.task_k.get(t, self.select):
+            return None
+        return blk.gates[t]
+    def get_gate_alphas(self, lora_id: int) -> dict:
+        """α (trọng số Shared LoRA) trung bình tại các tầng có gating của task `lora_id`."""
+        if not self.use_gating or lora_id <= 0:
+            return {}
+        k = self.task_k.get(lora_id, self.select)
+        return {idx: round(self.blocks[idx].gates[lora_id].mean_alpha(), 4)
+                for idx in range(k, len(self.blocks)) if lora_id < len(self.blocks[idx].gates)}
     def startEMA(self):
         for block in self.blocks:
             block.startEMA()
     def EMA(self,alpha):
-        for block in self.blocks:
-            block.EMA(alpha)
+        t = self.cur_loraid
+        for idx, block in enumerate(self.blocks):
+            gate_id = None
+            if self.use_gating and t is not None and t > 0 and idx >= self.task_k.get(t, self.select):
+                gate_id = t
+            block.EMA(alpha, gate_id)
     def copy_lora_weights(self, loraidA: int, loraidB: int,A_loras: bool,B_loras:bool):
         for block in self.blocks:
             block.copy_lora_weights(loraidA,loraidB,A_loras,B_loras)
@@ -392,7 +537,7 @@ class VisionTransformer(nn.Module):
                 gv_per_block.append(0.0)
         return gv_per_block
 
-    def determine_dynamic_k(self, k_min=5, k_max=11, threshold=1.5) -> int:
+    def determine_dynamic_k(self, k_min=5, k_max=11, threshold=1.5, k_default=None) -> int:
         """Dựa trên gradient variance, xác định ngưỡng k tối ưu.
         
         Logic: Quét từ tầng sâu nhất (k_max-1) ngược về tầng nông (k_min).
@@ -404,17 +549,19 @@ class VisionTransformer(nn.Module):
             k_min: Giới hạn dưới cho k (ít nhất k_min tầng Shared)
             k_max: Giới hạn trên cho k (nhiều nhất k_max tầng Shared)
             threshold: Ngưỡng tỷ lệ GV so với trung bình
+            k_default: k trả về khi không có tín hiệu gradient (mặc định: self.select)
             
         Returns:
             int: Giá trị k mới (split point)
         """
+        fallback_k = self.select if k_default is None else k_default
         gv = self.compute_gradient_variance()
         if not gv or all(v == 0 for v in gv):
-            return self.select  # Giữ nguyên k mặc định nếu không có gradient
+            return fallback_k  # Giữ nguyên k mặc định nếu không có gradient
 
         mean_gv = sum(gv) / len(gv)
         if mean_gv == 0:
-            return self.select
+            return fallback_k
 
         # Tìm tầng nông nhất mà GV vẫn cao (cần task-specific adaptation)
         # Quét từ k_max-1 ngược về k_min
@@ -451,7 +598,7 @@ class VisionTransformer(nn.Module):
         x = self.pos_drop(x)
         SL_x = None
         for idx, blk in enumerate(self.blocks):
-            x = blk(x,lora_ids,ifEMA)
+            x = blk(x,lora_ids,ifEMA,self._resolve_gate(idx, lora_ids, ifEMA))
             if (ifEMA and idx == self.select-1):
                 SL_x = x
         if self.global_pool:
@@ -476,8 +623,9 @@ class VisionTransformer(nn.Module):
             x = self.head(x)
         return x,SL_x
     def forward_SL(self,x,lora_ids):
-        for idx, blk in enumerate(self.blocks[self.select:]):
-            x = blk(x,lora_ids)
+        for offset, blk in enumerate(self.blocks[self.select:]):
+            idx = self.select + offset  # chỉ số tuyệt đối của block
+            x = blk(x,lora_ids,False,self._resolve_gate(idx, lora_ids, False))
         if self.global_pool:
             x = x[:, 1:, :].mean(dim=1)  # global pool without cls token
             outcome = self.fc_norm(x)

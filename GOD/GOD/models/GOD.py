@@ -97,6 +97,8 @@ class Learner(BaseLearner):
                 self._network.to(self._device)
                 self._network.fc.add_task_layer()
                 self._network.to(self._device)
+                # Tắt gating trong warm-up: đo GV trên TL thuần, không bị β làm co gradient
+                self._network.backbone.gating_active = False
                 effective_k = self._warmup_and_determine_k(train_loader)
                 logging.info("Dynamic k: {} -> {} for task {}".format(
                     self.args["free"], effective_k, self._cur_task))
@@ -108,6 +110,7 @@ class Learner(BaseLearner):
                     param.requires_grad = True
             else:
                 # Giữ nguyên hành vi gốc: k cố định
+                effective_k = self.args["free"]
                 self._network.backbone.unfreeze_lora([self._cur_task], self.args["free"])
                 self._network.update_simplefc(self._total_classes)
                 for param in self._network.simple_fc.parameters():
@@ -116,17 +119,41 @@ class Learner(BaseLearner):
                 self._network.fc.add_task_layer()
                 self._network.to(self._device)
 
-            optimizer = optim.SGD(
-                self._network.parameters(),
-                lr=self.args["lrate"],
-                momentum=0.9,
-                weight_decay=self.args["weight_decay"],
-            )  # 1e-5
+            # Các tầng l < k của task hiện tại phải là Shared LoRA thuần (hoàn tác
+            # cập nhật của warm-up / task trước). Với k cố định đây là no-op.
+            self._network.backbone.sync_shared_lora(self._cur_task, effective_k)
+
+            # === MICRO GATING ===
+            self._network.backbone.gating_active = True
+            if self.args.get("gating", False):
+                n_gate = sum(p.numel() for n, p in self._network.named_parameters()
+                             if '.gates.' in n and p.requires_grad)
+                logging.info("[Gating] Task {}: type={}, trainable gate params={}, gated blocks=[{}, {})".format(
+                    self._cur_task, self.args.get("gating_type", "scalar"), n_gate,
+                    effective_k, len(self._network.backbone.blocks)))
+
+            optimizer = self._build_optimizer(self.args["lrate"], self.args["weight_decay"])  # 1e-5
             scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.args['init_epoch'],
                                                              eta_min=self.args['min_lr'])
             self._update_representation(train_loader, test_loader, optimizer, scheduler)
+            if self.args.get("gating", False):
+                logging.info("[Gating] Task {} alpha (Shared LoRA weight) per block: {}".format(
+                    self._cur_task, self._network.backbone.get_gate_alphas(self._cur_task)))
             result3 = self._compute_accuracy_EMA_Task(self._network, test_loader,Top=3)
             self.all_ema3.append(result3['top1_accuracy'])
+
+    def _build_optimizer(self, lr, weight_decay):
+        """SGD với param group riêng cho gate: lr = gating_lr, không weight decay
+        (weight decay sẽ kéo logit về 0, tức ép α về 0.5)."""
+        gate_params, other_params = [], []
+        for name, p in self._network.named_parameters():
+            (gate_params if '.gates.' in name else other_params).append(p)
+        param_groups = [{"params": other_params, "lr": lr, "weight_decay": weight_decay}]
+        if gate_params:
+            param_groups.append({"params": gate_params,
+                                 "lr": self.args.get("gating_lr", lr),
+                                 "weight_decay": 0.0})
+        return optim.SGD(param_groups, lr=lr, momentum=0.9, weight_decay=weight_decay)
 
     def _init_train(self, train_loader, test_loader, optimizer, scheduler):
         prog_bar = tqdm(range(self.args["init_epoch"]))
@@ -267,7 +294,7 @@ class Learner(BaseLearner):
         # Tính gradient variance và quyết định k
         gv = self._network.backbone.compute_gradient_variance()
         new_k = self._network.backbone.determine_dynamic_k(
-            k_min=k_min, k_max=k_max, threshold=threshold
+            k_min=k_min, k_max=k_max, threshold=threshold, k_default=self.args["free"]
         )
 
         logging.info("[Dynamic k] Gradient variance per block: {}".format(

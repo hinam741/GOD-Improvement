@@ -16,7 +16,11 @@ def get_backbone(args, pretrained=False):
                 # VPT related
                 vpt_on=False,
                 vpt_num=0,
-                r=16, lora_alpha=1, lora_dropout=0.
+                r=16, lora_alpha=1, lora_dropout=0.,
+                # Micro gating (Dynamic & Adaptive Layer Splitting)
+                gating=args.get("gating", False),
+                gating_type=args.get("gating_type", "scalar"),
+                gate_init_alpha=args.get("gate_init_alpha", 0.1),
             )
             if name == "vit_base_patch16_224_lora":
                 model = Lora_vit.vit_base_patch16_224(num_classes=0,

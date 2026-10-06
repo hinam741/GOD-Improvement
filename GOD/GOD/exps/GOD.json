@@ -34,6 +34,10 @@
     "k_max": 11,
     "warmup_epochs": 3,
     "gradient_threshold": 1.5,
+    "gating": true,
+    "gating_type": "scalar",
+    "gate_init_alpha": 0.1,
+    "gating_lr": 0.01,
     "alpha": 0.9,
     "m": 0.4
 
