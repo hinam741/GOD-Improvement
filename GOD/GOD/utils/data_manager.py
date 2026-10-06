@@ -4,7 +4,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 from utils.data import iCIFAR10, iCIFAR100, iImageNet100, iImageNet1000, iCIFAR224, iImageNetR, iImageNetA, CUB, CARS, \
-    objectnet, omnibenchmark, vtab
+    objectnet, omnibenchmark, vtab, mstar, nih_chest_xray, indian_pines
 
 
 class DataManager(object):
@@ -240,6 +240,12 @@ def _get_idata(dataset_name, args=None):
         return omnibenchmark()
     elif name == "vtab":
         return vtab()
+    elif name == "mstar":
+        return mstar()
+    elif name == "nih_chest_xray":
+        return nih_chest_xray()
+    elif name == "indian_pines":
+        return indian_pines()
 
     else:
         raise NotImplementedError("Unknown dataset {}.".format(dataset_name))

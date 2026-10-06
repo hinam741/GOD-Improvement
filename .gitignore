@@ -7,3 +7,4 @@ __pycache__/
 .vscode/
 implementation_plan.md
 data/
+new_datasets.txt

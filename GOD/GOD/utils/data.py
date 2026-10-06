@@ -366,3 +366,63 @@ class vtab(iData):
 
         self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
         self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
+
+
+class mstar(iData):
+    use_path = True
+
+    train_trsf = build_transform(True, None)
+    test_trsf = build_transform(False, None)
+    common_trsf = []
+
+    class_order = np.arange(10).tolist()
+
+    def download_data(self):
+        train_dir = "./data/mstar/train/"
+        test_dir = "./data/mstar/test/"
+
+        train_dset = datasets.ImageFolder(train_dir)
+        test_dset = datasets.ImageFolder(test_dir)
+
+        self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
+        self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
+
+
+class nih_chest_xray(iData):
+    use_path = True
+
+    train_trsf = build_transform(True, None)
+    test_trsf = build_transform(False, None)
+    common_trsf = []
+
+    class_order = np.arange(14).tolist()
+
+    def download_data(self):
+        train_dir = "./data/nih_chest_xray/train/"
+        test_dir = "./data/nih_chest_xray/test/"
+
+        train_dset = datasets.ImageFolder(train_dir)
+        test_dset = datasets.ImageFolder(test_dir)
+
+        self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
+        self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
+
+
+class indian_pines(iData):
+    use_path = True
+
+    train_trsf = build_transform(True, None)
+    test_trsf = build_transform(False, None)
+    common_trsf = []
+
+    class_order = np.arange(16).tolist()
+
+    def download_data(self):
+        train_dir = "./data/indian_pines/train/"
+        test_dir = "./data/indian_pines/test/"
+
+        train_dset = datasets.ImageFolder(train_dir)
+        test_dset = datasets.ImageFolder(test_dir)
+
+        self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
+        self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
