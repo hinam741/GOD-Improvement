@@ -8,4 +8,5 @@ __pycache__/
 implementation_plan.md
 data/
 new_datasets.txt
+*ipynb/
 *.ipynb
