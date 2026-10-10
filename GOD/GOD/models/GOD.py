@@ -147,7 +147,8 @@ class Learner(BaseLearner):
         (weight decay sẽ kéo logit về 0, tức ép α về 0.5)."""
         gate_params, other_params = [], []
         for name, p in self._network.named_parameters():
-            (gate_params if '.gates.' in name else other_params).append(p)
+            if p.requires_grad:
+                (gate_params if '.gates.' in name else other_params).append(p)
         param_groups = [{"params": other_params, "lr": lr, "weight_decay": weight_decay}]
         if gate_params:
             param_groups.append({"params": gate_params,

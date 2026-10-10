@@ -559,7 +559,11 @@ class VisionTransformer(nn.Module):
         if not gv or all(v == 0 for v in gv):
             return fallback_k  # Giữ nguyên k mặc định nếu không có gradient
 
-        mean_gv = sum(gv) / len(gv)
+        mean_gv = 0
+        active_gv = [v for v in gv if v > 0.0]
+        if active_gv:
+            mean_gv = sum(active_gv) / len(active_gv)
+            
         if mean_gv == 0:
             return fallback_k
 
